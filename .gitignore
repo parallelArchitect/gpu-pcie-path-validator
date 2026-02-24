@@ -1,0 +1,13 @@
+# Runtime logs
+logs/
+
+# Build artifacts
+*.o
+gpu_pcie_validator
+build/
+
+# Crash dumps
+*.core
+
+# Generic logs
+*.log
