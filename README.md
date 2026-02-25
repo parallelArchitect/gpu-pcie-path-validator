@@ -116,7 +116,7 @@ All devices:
 
 ## Usage
 
-See: [docs/USAGE.md](docs/USAGE.md)
+See: [docs/Usage.md](docs/Usage.md)
 
 ---
 
