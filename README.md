@@ -126,7 +126,7 @@ CUDA memcpy throughput measures payload transfer rate per direction for a define
 
 NVML PCIe throughput (`nvmlDeviceGetPcieThroughput`) reports bus-level traffic counters sampled over a measurement window.
 
-These metrics may differ due to sampling window alignment, DMA overlap, or concurrent PCIe activity.
+These metrics may differ due to sampling window alignment, DMA overlap, or other PCIe traffic on the bus.
 
 NVML API reference:
 [https://docs.nvidia.com/deploy/nvml-api/group__nvmlDeviceQueries.html](https://docs.nvidia.com/deploy/nvml-api/group__nvmlDeviceQueries.html)

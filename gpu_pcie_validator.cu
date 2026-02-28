@@ -6,7 +6,7 @@
  * Author      : Joe McLaren (Human-AI Collaborative Engineering)
  * Repository  : https://github.com/parallelArchitect
  * File        : gpu_pcie_validator.cu
- * Version     : 4.0
+ * Version     : 4.1
  *
  * DESCRIPTION
  * -----------
@@ -837,6 +837,59 @@ struct RunConfig
 
 static double ClampPos(double x) { return x < 0.0 ? 0.0 : x; }
 
+// =============================================================================
+// PROGRESS REPORTER
+// Prints timestamped status lines to stderr during validation so the operator
+// always knows what phase the tool is in. Single-device mode prints per-sample
+// ticker lines during the NVML window. Multi-GPU (all_devices) mode prints
+// only phase summaries per GPU to avoid flooding the screen.
+// All progress output goes to stderr — stdout and log files remain clean.
+// =============================================================================
+
+
+static void ProgressInit()
+{
+}
+
+
+
+// Phase announcements suppressed — one bar only.
+static void Progress(int gpu_idx, const std::string& msg)
+{
+  (void)gpu_idx; (void)msg; // silent
+}
+
+// Sampling tick: overwrites the same line using \r so the progress bar
+// stays as a single updating line. When the run finishes, ProgressDone()
+// clears it with spaces so the report prints on a clean screen.
+static void ProgressTick(int gpu_idx, long long elapsed_s, long long total_s,
+                         double rx, double tx, double power_w, double temp_c)
+{
+  // Build the bar: [=========>  ] 25/30s
+  int bar_width = 20;
+  int filled    = (total_s > 0) ? (int)((elapsed_s * bar_width) / total_s) : 0;
+  if (filled > bar_width) filled = bar_width;
+  char bar[32];
+  for (int i = 0; i < bar_width; i++)
+    bar[i] = (i < filled) ? '=' : ' ';
+  bar[bar_width] = '\0';
+
+  char buf[200];
+  std::snprintf(buf, sizeof(buf),
+    "\r[%s>%s] %lld/%llds | RX %5.2f TX %5.2f GB/s | %5.1fW %3.0fC   ",
+    bar, (filled < bar_width ? "" : ""), elapsed_s, total_s,
+    rx, tx, power_w, temp_c);
+  std::fprintf(stderr, "%s", buf);
+  std::fflush(stderr);
+}
+
+// Call once when sampling is done — clears the progress bar line
+static void ProgressDone()
+{
+  std::fprintf(stderr, "\r%80s\r", "");
+  std::fflush(stderr);
+}
+
 static void TrafficWorker(std::atomic<bool>& go, int device,
                           size_t bytes, int window_ms)
 {
@@ -1021,7 +1074,7 @@ static void ListDevices()
 static void Usage()
 {
   std::cout <<
-    "GPU PCIe Validator v4.0\n\n"
+    "GPU PCIe Validator v4.1\n\n"
     "Usage:\n"
     "  ./gpu_pcie_validator --list-devices\n"
     "  ./gpu_pcie_validator --device N [options]\n"
@@ -1046,8 +1099,11 @@ static void Usage()
 
 static int RunValidation(const RunConfig& cfg,
                          std::ostream& txt_out,
-                         std::ostream& json_out)
+                         std::ostream& json_out,
+                         bool verbose = true)
 {
+  ProgressInit();
+
   // ---- Device setup -------------------------------------------------------
 
   int cuda_devcount = 0;
@@ -1088,6 +1144,21 @@ static int RunValidation(const RunConfig& cfg,
 
   char gpu_name[128] = {0};
   nvmlDeviceGetName(nvdev, gpu_name, sizeof(gpu_name));
+
+  if (verbose)
+  {
+    // Announce GPU identity immediately so the operator sees something at launch
+    LinkInfo li_early{};
+    std::string link_early = "unknown";
+    if (NVML_GetLinkInfo(nvdev, li_early))
+      link_early = "Gen" + std::to_string(li_early.cur_gen)
+                 + " x" + std::to_string(li_early.cur_width);
+    char msg[256];
+    std::snprintf(msg, sizeof(msg), "Init: %s | %s | Driver %s",
+                  gpu_name, link_early.c_str(), "");
+    Progress(cfg.device_index, std::string("Init: ") + gpu_name
+             + " | " + link_early);
+  }
 
   char gpu_uuid[96] = {0};
   nvmlDeviceGetUUID(nvdev, gpu_uuid, sizeof(gpu_uuid));
@@ -1135,6 +1206,8 @@ static int RunValidation(const RunConfig& cfg,
 
   // ---- Pre-load snapshots -------------------------------------------------
 
+  if (verbose) Progress(cfg.device_index, "Pre-load: capturing clocks, AER baseline, replay counter");
+
   double p_start = 0.0, t_start = 0.0;
   bool have_pt_start = NVML_GetPowerTemp(nvdev, p_start, t_start);
 
@@ -1142,6 +1215,7 @@ static int RunValidation(const RunConfig& cfg,
   AerCounters    aer_pre  = ReadAerCounters(norm_bdf);
 
   // Link-wake: bring PCIe link from Gen1 idle to full negotiated speed
+  if (verbose) Progress(cfg.device_index, "Link wake: forcing PCIe link to full negotiated speed");
   {
     cudaSetDevice(cfg.device_index);
     // 4 MiB: minimum DMA size observed to reliably force the PCIe link
@@ -1168,6 +1242,14 @@ static int RunValidation(const RunConfig& cfg,
 
   // ---- Bandwidth measurement ----------------------------------------------
 
+  if (verbose)
+  {
+    char msg[128];
+    std::snprintf(msg, sizeof(msg),
+      "Bandwidth: measuring %d MiB H2D + D2H (6 passes)...", cfg.size_mib);
+    Progress(cfg.device_index, msg);
+  }
+
   const size_t bytes     = (size_t)cfg.size_mib * 1024ULL * 1024ULL;
   bool         use_pinned = (cfg.memory_mode == "pinned");
 
@@ -1185,6 +1267,15 @@ static int RunValidation(const RunConfig& cfg,
     return 1;
   }
 
+  if (verbose)
+  {
+    char msg[128];
+    std::snprintf(msg, sizeof(msg),
+      "Bandwidth: complete | avg %.2f GB/s H2D %.2f D2H %.2f",
+      bw.bulk_avg_gbs, bw.bulk_h2d_gbs, bw.bulk_d2h_gbs);
+    Progress(cfg.device_index, msg);
+  }
+
   // ---- NVML sampling window -----------------------------------------------
 
   std::vector<Sample> samples;
@@ -1198,9 +1289,32 @@ static int RunValidation(const RunConfig& cfg,
   auto t0 = std::chrono::steady_clock::now();
   go.store(true, std::memory_order_release);
 
+  if (verbose)
+  {
+    char msg[128];
+    std::snprintf(msg, sizeof(msg),
+      "Sampling: %d ms window | %d ms interval | started",
+      cfg.window_ms, cfg.interval_ms);
+    Progress(cfg.device_index, msg);
+  }
+
   int target_samples = (cfg.interval_ms > 0)
                      ? (cfg.window_ms / cfg.interval_ms) : 1;
   if (target_samples < 1) target_samples = 1;
+
+  // Tick counter: print progress every ~5 seconds in single-device mode.
+  // Uses a rolling average over the last 10 samples to smooth NVML's
+  // 20ms counter reset cycle — prevents noisy 0.00/12.xx GB/s jumps
+  // that would confuse engineers reading the live output.
+  // In multi-GPU (all_devices) mode verbose is false — no per-tick output.
+  const int    tick_every_ms  = 5000;
+  long long    last_tick_ms   = -tick_every_ms; // force first tick immediately
+  const int    roll_window    = 10;             // samples in rolling average
+  double       roll_rx_sum    = 0.0;
+  double       roll_tx_sum    = 0.0;
+  double       roll_pw_sum    = 0.0;
+  double       roll_tc_sum    = 0.0;
+  int          roll_count     = 0;
 
   auto next = t0;
   while (true)
@@ -1219,6 +1333,41 @@ static int RunValidation(const RunConfig& cfg,
     if (NVML_GetPowerTemp(nvdev, pw, tc))     { s.power_w = pw; s.temp_c = tc; }
 
     samples.push_back(s);
+
+    // Maintain rolling sums — subtract oldest sample when window is full
+    if (roll_count == roll_window)
+    {
+      int oldest = (int)samples.size() - 1 - roll_window;
+      if (oldest >= 0)
+      {
+        roll_rx_sum -= samples[oldest].rx_gbs;
+        roll_tx_sum -= samples[oldest].tx_gbs;
+        roll_pw_sum -= samples[oldest].power_w;
+        roll_tc_sum -= samples[oldest].temp_c;
+        roll_count--;
+      }
+    }
+    roll_rx_sum += rx;
+    roll_tx_sum += tx;
+    roll_pw_sum += pw;
+    roll_tc_sum += tc;
+    roll_count++;
+
+    // Print tick every 5 seconds using rolling average
+    if (verbose && (elapsed - last_tick_ms) >= tick_every_ms)
+    {
+      last_tick_ms = elapsed;
+      double n         = (double)std::max(1, roll_count);
+      double avg_rx    = roll_rx_sum / n;
+      double avg_tx    = roll_tx_sum / n;
+      double avg_pw    = roll_pw_sum / n;
+      double avg_tc    = roll_tc_sum / n;
+      long long total_s   = (long long)cfg.window_ms / 1000;
+      long long elapsed_s = elapsed / 1000;
+      ProgressTick(cfg.device_index, elapsed_s, total_s,
+                   avg_rx, avg_tx, avg_pw, avg_tc);
+    }
+
     next += std::chrono::milliseconds(cfg.interval_ms);
   }
 
@@ -1229,6 +1378,17 @@ static int RunValidation(const RunConfig& cfg,
     std::chrono::milliseconds>(t1 - t0).count();
   double achieved_interval_ms = samples.size() > 1
     ? (window_actual_ms / (double)samples.size()) : window_actual_ms;
+
+  if (verbose)
+  {
+    // Clear the progress bar line before printing completion message
+    ProgressDone();
+    char msg[128];
+    std::snprintf(msg, sizeof(msg),
+      "Sampling: complete | %zu samples in %.0f ms",
+      samples.size(), window_actual_ms);
+    Progress(cfg.device_index, msg);
+  }
 
   // ---- Post-load snapshots ------------------------------------------------
 
@@ -1300,6 +1460,18 @@ static int RunValidation(const RunConfig& cfg,
 
   int exit_status = (state == "HEALTHY") ? 0 : 2;
 
+  if (verbose)
+  {
+    char msg[128];
+    std::snprintf(msg, sizeof(msg),
+      "Assessment: %s | efficiency %.1f%% | replay delta %lld | AER corr %lld",
+      state.c_str(), eff_pct, delta, aer_corr_total);
+    Progress(cfg.device_index, msg);
+    // Write clear sequence directly to /dev/tty so both stdout and stderr
+    // content is cleared regardless of stream routing.
+
+  }
+
   std::string ts_iso = NowISO8601();
   std::string run_id = NowStamp() + "_GPU" + std::to_string(cfg.device_index);
 
@@ -1334,7 +1506,7 @@ static int RunValidation(const RunConfig& cfg,
       return oss.str();
     };
 
-    out << "\nGPU PCIe Validator v4.0\n\n";
+    out << "\nGPU PCIe Validator v4.1\n\n";
 
     sec("GPU Identity");
     kv ("Model",                gpu_name);
@@ -1795,7 +1967,7 @@ int main(int argc, char** argv)
     mkdir(log_dir.c_str(), 0755);
 
     std::ostringstream txt_buf, json_buf;
-    int status = RunValidation(cfg, txt_buf, json_buf);
+    int status = RunValidation(cfg, txt_buf, json_buf, true);
 
     std::cout << txt_buf.str();
 
@@ -1849,8 +2021,15 @@ int main(int argc, char** argv)
     dev_cfg.device_index = dev;
 
     std::ostringstream txt_buf, json_buf;
-    int status = RunValidation(dev_cfg, txt_buf, json_buf);
+    int status = RunValidation(dev_cfg, txt_buf, json_buf, false);
     if (status > worst_status) worst_status = status;
+
+    // Summary line per GPU in multi-GPU mode — no ticker flood
+    {
+      char msg[64];
+      std::snprintf(msg, sizeof(msg), "GPU %d complete | status %d", dev, status);
+      Progress(dev, msg);
+    }
 
     std::cout << txt_buf.str();
 
