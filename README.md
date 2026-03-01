@@ -151,12 +151,15 @@ Does not:
 Joe McLaren (parallelArchitect)
 Human-directed GPU engineering with AI assistance.
 
+## Contact
+
+gpu.validation@gmail.com
+
 ---
 
 ## License
 
 MIT
-
 
 
 
